@@ -3,13 +3,28 @@ import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** OAuth scopes needed to read and modify the user's playlists. */
+/** OAuth scopes needed to read and modify playlists, and to read listening history. */
 export const SCOPES = [
   "playlist-read-private",
   "playlist-read-collaborative",
   "playlist-modify-private",
   "playlist-modify-public",
+  "user-top-read",
+  "user-read-recently-played",
 ];
+
+/** Time windows Spotify offers for top items, with the labels we show users. */
+export const TIME_RANGES = ["short_term", "medium_term", "long_term"] as const;
+export type TimeRange = (typeof TIME_RANGES)[number];
+
+export const TIME_RANGE_LABELS: Record<TimeRange, string> = {
+  short_term: "approximately the last 4 weeks",
+  medium_term: "approximately the last 6 months",
+  long_term: "several years of listening",
+};
+
+/** Spotify caps recently-played and top-item pages at 50. */
+export const MAX_HISTORY_LIMIT = 50;
 
 const API_BASE = "https://api.spotify.com/v1";
 const ACCOUNTS_BASE = "https://accounts.spotify.com";
@@ -118,6 +133,26 @@ export async function writeTokenCache(cache: TokenCache): Promise<void> {
 }
 
 /**
+ * Scopes in SCOPES that the cached token was not granted. A token minted before
+ * a scope was added keeps working for the old endpoints but 403s on the new
+ * ones, so we check up front rather than surfacing a cryptic API error.
+ */
+export function missingScopes(cache: TokenCache | null): string[] {
+  if (!cache) return [];
+  const granted = new Set((cache.scope ?? "").split(/\s+/).filter(Boolean));
+  return SCOPES.filter((scope) => !granted.has(scope));
+}
+
+export function reauthorizeMessage(missing: string[]): string {
+  return (
+    `Stored Spotify token is missing required scope(s): ${missing.join(", ")}. ` +
+    `Delete the token cache and re-authorize:\n` +
+    `  rm ${tokenFilePath()}\n` +
+    `  pnpm run auth`
+  );
+}
+
+/**
  * Accepts a bare id, `spotify:playlist:ID`, or an open.spotify.com playlist URL
  * (with or without a query string) and returns the bare id.
  */
@@ -164,12 +199,48 @@ export function normalizeTrackUri(input: string): string {
   );
 }
 
+/** Validates a caller-supplied time range, defaulting to the ~6 month window. */
+export function normalizeTimeRange(input: string | undefined | null): TimeRange {
+  const value = (input ?? "").trim() || "medium_term";
+  if ((TIME_RANGES as readonly string[]).includes(value)) return value as TimeRange;
+
+  throw new SpotifyError(
+    `Unrecognised time_range: ${value}. Expected one of ${TIME_RANGES.join(", ")}.`
+  );
+}
+
+export function clampLimit(limit: number | undefined, fallback: number, max: number): number {
+  return Math.min(max, Math.max(1, Math.trunc(limit ?? fallback)));
+}
+
 export interface PlaylistTrack {
   name: string;
   artists: string[];
   album: string;
   uri: string;
   addedAt: string | null;
+}
+
+export interface TopArtist {
+  name: string;
+  genres: string[];
+  uri: string;
+}
+
+export interface PlayEntry {
+  playedAt: string | null;
+  track: PlaylistTrack;
+}
+
+/** Shared shape for the track objects returned by playlists, search and history. */
+function toTrack(raw: any, addedAt: string | null = null): PlaylistTrack {
+  return {
+    name: raw?.name ?? "(unknown title)",
+    artists: (raw?.artists ?? []).map((a: any) => a.name).filter(Boolean),
+    album: raw?.album?.name ?? "",
+    uri: raw?.uri ?? "",
+    addedAt,
+  };
 }
 
 export interface PlaylistMeta {
@@ -203,9 +274,13 @@ export class SpotifyClient {
     const cache = await readTokenCache();
     if (!cache?.refresh_token) {
       throw new SpotifyError(
-        `No Spotify refresh token found at ${tokenFilePath()}. Run \`npm run auth\` once to authorize this app.`
+        `No Spotify refresh token found at ${tokenFilePath()}. Run \`pnpm run auth\` once to authorize this app.`
       );
     }
+
+    const missing = missingScopes(cache);
+    if (missing.length) throw new SpotifyError(reauthorizeMessage(missing));
+
     this.cache = cache;
     return cache;
   }
@@ -365,13 +440,7 @@ export class SpotifyClient {
           skipped++;
           continue;
         }
-        tracks.push({
-          name: track.name ?? "(unknown title)",
-          artists: (track.artists ?? []).map((a: any) => a.name).filter(Boolean),
-          album: track.album?.name ?? "",
-          uri: track.uri,
-          addedAt: item.added_at ?? null,
-        });
+        tracks.push(toTrack(track, item.added_at ?? null));
       }
 
       offset += items.length;
@@ -385,13 +454,48 @@ export class SpotifyClient {
     const data = await this.request<any>("/search", {
       query: { q: query, type: "track", limit },
     });
-    return (data.tracks?.items ?? []).map((track: any) => ({
-      name: track.name,
-      artists: (track.artists ?? []).map((a: any) => a.name).filter(Boolean),
-      album: track.album?.name ?? "",
-      uri: track.uri,
-      addedAt: null,
+    return (data.tracks?.items ?? []).map((track: any) => toTrack(track));
+  }
+
+  /**
+   * The user's most-played tracks for a window, in rank order.
+   * Spotify exposes no play counts — position in this list is the only signal.
+   */
+  async topTracks(timeRange: TimeRange, limit: number): Promise<PlaylistTrack[]> {
+    const data = await this.request<any>("/me/top/tracks", {
+      query: { time_range: timeRange, limit },
+    });
+    return (data.items ?? []).map((track: any) => toTrack(track));
+  }
+
+  async topArtists(timeRange: TimeRange, limit: number): Promise<TopArtist[]> {
+    const data = await this.request<any>("/me/top/artists", {
+      query: { time_range: timeRange, limit },
+    });
+    return (data.items ?? []).map((artist: any) => ({
+      name: artist?.name ?? "(unknown artist)",
+      genres: artist?.genres ?? [],
+      uri: artist?.uri ?? "",
     }));
+  }
+
+  /**
+   * The last plays Spotify still holds, newest first. This is a rolling window
+   * of at most 50 items — it is not a history and cannot be paged backwards far.
+   */
+  async recentlyPlayed(limit: number): Promise<PlayEntry[]> {
+    const data = await this.request<any>("/me/player/recently-played", {
+      query: { limit },
+    });
+
+    const entries: PlayEntry[] = [];
+    for (const item of data.items ?? []) {
+      // Playlists renamed `track` to `item`; accept either in case this follows.
+      const raw = item?.track ?? item?.item;
+      if (!raw?.uri) continue;
+      entries.push({ playedAt: item.played_at ?? null, track: toTrack(raw) });
+    }
+    return entries;
   }
 
   /** Adds URIs in chunks of 100 (the API limit). Returns the number added. */
@@ -412,4 +516,9 @@ export function formatArtists(artists: string[]): string {
 
 export function formatAddedDate(addedAt: string | null): string {
   return addedAt ? addedAt.slice(0, 10) : "unknown";
+}
+
+/** `2026-08-15T09:25:57Z` -> `2026-08-15 09:25` (UTC, as Spotify reports it). */
+export function formatPlayedAt(playedAt: string | null): string {
+  return playedAt ? playedAt.slice(0, 16).replace("T", " ") : "unknown time";
 }

@@ -3,13 +3,22 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
+  MAX_HISTORY_LIMIT,
   SpotifyClient,
   SpotifyError,
+  TIME_RANGES,
+  TIME_RANGE_LABELS,
+  clampLimit,
   formatAddedDate,
   formatArtists,
+  formatPlayedAt,
   loadConfig,
+  missingScopes,
   normalizePlaylistId,
+  normalizeTimeRange,
   normalizeTrackUri,
+  readTokenCache,
+  reauthorizeMessage,
 } from "./spotify.js";
 
 function text(body: string) {
@@ -40,6 +49,18 @@ const playlistIdArg = z
     "Playlist to target: bare id, spotify:playlist:ID, or an open.spotify.com/playlist/... URL. " +
       "Defaults to the SPOTIFY_DEFAULT_PLAYLIST env var when omitted."
   );
+
+const timeRangeArg = z
+  .enum(TIME_RANGES)
+  .optional()
+  .describe(
+    "Listening window: short_term (~4 weeks), medium_term (~6 months, default) or " +
+      "long_term (several years)."
+  );
+
+/** Spotify publishes no play counts, so every history tool repeats this. */
+const NO_COUNTS_NOTE =
+  "Spotify exposes no per-track play counts — this is a ranking by play frequency, not a tally.";
 
 server.registerTool(
   "pull_playlist",
@@ -175,9 +196,194 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "top_tracks",
+  {
+    title: "Top tracks",
+    description:
+      "The user's most-played tracks over a listening window, in rank order. " +
+      "Spotify provides no exact play counts — rank is the only signal.",
+    inputSchema: {
+      time_range: timeRangeArg,
+      limit: z.number().int().optional().describe("Number of tracks, 1-50 (default 20)."),
+    },
+  },
+  async ({ time_range, limit }) => {
+    try {
+      const range = normalizeTimeRange(time_range);
+      const count = clampLimit(limit, 20, MAX_HISTORY_LIMIT);
+      const tracks = await spotify.topTracks(range, count);
+      if (!tracks.length) return text(`No top tracks for ${TIME_RANGE_LABELS[range]}.`);
+
+      const lines = tracks.map(
+        (t, i) => `${i + 1}. ${formatArtists(t.artists)} - ${t.name}  [${t.uri}]`
+      );
+      const header =
+        `Top ${tracks.length} tracks — ${TIME_RANGE_LABELS[range]} (${range}).\n${NO_COUNTS_NOTE}`;
+
+      return text([header, "", ...lines].join("\n"));
+    } catch (err) {
+      return failure(err);
+    }
+  }
+);
+
+server.registerTool(
+  "top_artists",
+  {
+    title: "Top artists",
+    description:
+      "The user's most-played artists over a listening window, in rank order, with genres.",
+    inputSchema: {
+      time_range: timeRangeArg,
+      limit: z.number().int().optional().describe("Number of artists, 1-50 (default 20)."),
+    },
+  },
+  async ({ time_range, limit }) => {
+    try {
+      const range = normalizeTimeRange(time_range);
+      const count = clampLimit(limit, 20, MAX_HISTORY_LIMIT);
+      const artists = await spotify.topArtists(range, count);
+      if (!artists.length) return text(`No top artists for ${TIME_RANGE_LABELS[range]}.`);
+
+      const lines = artists.map(
+        (a, i) => `${i + 1}. ${a.name}` + (a.genres.length ? `  [${a.genres.join(", ")}]` : "")
+      );
+      const header =
+        `Top ${artists.length} artists — ${TIME_RANGE_LABELS[range]} (${range}).\n${NO_COUNTS_NOTE}`;
+
+      return text([header, "", ...lines].join("\n"));
+    } catch (err) {
+      return failure(err);
+    }
+  }
+);
+
+server.registerTool(
+  "recently_played",
+  {
+    title: "Recently played",
+    description:
+      "The most recent plays with timestamps, newest first. This is a rolling window of the " +
+      "last 50 plays only — it is not a full listening history.",
+    inputSchema: {
+      limit: z.number().int().optional().describe("Number of plays, 1-50 (default 50)."),
+    },
+  },
+  async ({ limit }) => {
+    try {
+      const count = clampLimit(limit, MAX_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
+      const entries = await spotify.recentlyPlayed(count);
+      if (!entries.length) return text("No recent plays returned by Spotify.");
+
+      const lines = entries.map(
+        (e) =>
+          `${formatPlayedAt(e.playedAt)} — ${formatArtists(e.track.artists)} - ${e.track.name}  [${
+            e.track.uri
+          }]`
+      );
+      const header =
+        `${entries.length} most recent play(s), newest first (times in UTC).\n` +
+        `Spotify only retains the last ${MAX_HISTORY_LIMIT} plays, so this window is not a full history.`;
+
+      return text([header, "", ...lines].join("\n"));
+    } catch (err) {
+      return failure(err);
+    }
+  }
+);
+
+server.registerTool(
+  "playlist_rotation",
+  {
+    title: "Playlist rotation",
+    description:
+      "Cross-reference a playlist against listening data, grouping its tracks into HOT " +
+      "(in your top tracks), recent (played lately) and cold (neither).",
+    inputSchema: { playlist_id: playlistIdArg, time_range: timeRangeArg },
+  },
+  async ({ playlist_id, time_range }) => {
+    try {
+      const id = normalizePlaylistId(playlist_id);
+      const range = normalizeTimeRange(time_range);
+
+      const meta = await spotify.playlistMeta(id);
+      const { tracks, skipped } = await spotify.allTracks(id);
+      const top = await spotify.topTracks(range, MAX_HISTORY_LIMIT);
+      const recent = await spotify.recentlyPlayed(MAX_HISTORY_LIMIT);
+
+      const topRank = new Map(top.map((t, i) => [t.uri, i + 1]));
+
+      // Within the 50-play window a repeat is a real (if tiny) count, so keep it.
+      const plays = new Map<string, { count: number; latest: string | null }>();
+      for (const entry of recent) {
+        const seen = plays.get(entry.track.uri);
+        if (seen) seen.count += 1;
+        else plays.set(entry.track.uri, { count: 1, latest: entry.playedAt });
+      }
+
+      const ranked: Array<{ rank: number; line: string }> = [];
+      const recentOnly: string[] = [];
+      const cold: string[] = [];
+
+      for (const t of tracks) {
+        const label = `${formatArtists(t.artists)} - ${t.name}`;
+        const rank = topRank.get(t.uri);
+        const play = plays.get(t.uri);
+        const playNote = play
+          ? `, played ${play.count}× since ${formatPlayedAt(play.latest)}`
+          : "";
+
+        if (rank) ranked.push({ rank, line: `#${rank} — ${label}${playNote}` });
+        else if (play)
+          recentOnly.push(`${formatPlayedAt(play.latest)} — ${label} (${play.count}× in window)`);
+        else cold.push(label);
+      }
+
+      // Numeric rank order, so #2 precedes #10.
+      const hot = ranked.sort((a, b) => a.rank - b.rank).map((r) => r.line);
+      const section = (title: string, rows: string[], empty: string) =>
+        [`${title} (${rows.length})`, ...(rows.length ? rows.map((r) => `  ${r}`) : [`  ${empty}`])];
+
+      const lines = [
+        `Playlist: ${meta.name} (${meta.id}) — ${tracks.length} tracks` +
+          (skipped ? ` (${skipped} local/unavailable item(s) skipped)` : ""),
+        `Compared against your top tracks for ${TIME_RANGE_LABELS[range]} (${range}) and your last ${recent.length} plays.`,
+        "",
+        ...section("HOT — in your top tracks", hot, "none"),
+        "",
+        ...section("RECENT — played lately but not top-ranked", recentOnly, "none"),
+        "",
+        ...section("COLD — in neither list", cold, "none"),
+        "",
+        `Coverage caveat: top tracks and recent plays cover at most ${MAX_HISTORY_LIMIT} items each, ` +
+          `so "cold" means "absent from those two lists", not "never played".`,
+      ];
+
+      return text(lines.join("\n"));
+    } catch (err) {
+      return failure(err);
+    }
+  }
+);
+
+/**
+ * A token minted before the history scopes were added still authenticates, but
+ * 403s on /me/top and /me/player. Say so plainly at startup.
+ */
+async function checkScopes() {
+  const cache = await readTokenCache().catch(() => null);
+  const missing = missingScopes(cache);
+  if (!missing.length) return;
+
+  console.error(`[spotify-playlist-mcp] ${reauthorizeMessage(missing)}`);
+  process.exit(1);
+}
+
 async function main() {
+  await checkScopes();
   await server.connect(new StdioServerTransport());
-  console.error("[spotify-playlist-mcp] ready on stdio (4 tools)");
+  console.error("[spotify-playlist-mcp] ready on stdio (8 tools)");
 }
 
 main().catch((err) => {
