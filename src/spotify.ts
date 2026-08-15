@@ -152,36 +152,40 @@ export function reauthorizeMessage(missing: string[]): string {
   );
 }
 
+export type PlaylistRef = { kind: "id"; id: string } | { kind: "name"; name: string };
+
 /**
- * Accepts a bare id, `spotify:playlist:ID`, or an open.spotify.com playlist URL
- * (with or without a query string) and returns the bare id.
+ * Classifies a playlist reference. Ids, `spotify:playlist:ID` URIs and
+ * open.spotify.com URLs resolve straight to an id; anything else is taken as a
+ * playlist *name* to be looked up against the user's library.
+ *
+ * Spotify ids are always 22 base62 characters, which is what lets a bare word
+ * like "Electronic" be read as a name rather than a malformed id.
  */
-export function normalizePlaylistId(input: string | undefined | null): string {
+export function parsePlaylistRef(input: string | undefined | null): PlaylistRef {
   const raw = (input ?? "").trim();
   const fallback = (process.env.SPOTIFY_DEFAULT_PLAYLIST ?? "").trim();
   const value = raw || fallback;
 
   if (!value) {
     throw new SpotifyError(
-      "No playlist specified. Pass playlist_id (bare id, spotify:playlist:ID, or an " +
+      "No playlist specified. Pass playlist_id (a name, bare id, spotify:playlist:ID, or an " +
         "open.spotify.com/playlist/... URL), or set SPOTIFY_DEFAULT_PLAYLIST in the server env."
     );
   }
 
   const uriMatch = value.match(/^spotify:playlist:([A-Za-z0-9]+)$/);
-  if (uriMatch) return uriMatch[1];
+  if (uriMatch) return { kind: "id", id: uriMatch[1] };
 
-  const urlMatch = value.match(/playlist[/:]([A-Za-z0-9]+)/);
   if (/^https?:\/\//i.test(value)) {
-    if (urlMatch) return urlMatch[1];
+    const urlMatch = value.match(/playlist[/:]([A-Za-z0-9]+)/);
+    if (urlMatch) return { kind: "id", id: urlMatch[1] };
     throw new SpotifyError(`Could not find a playlist id in URL: ${value}`);
   }
 
-  if (/^[A-Za-z0-9]+$/.test(value)) return value;
+  if (/^[A-Za-z0-9]{22}$/.test(value)) return { kind: "id", id: value };
 
-  throw new SpotifyError(
-    `Unrecognised playlist reference: ${value}. Expected a bare id, spotify:playlist:ID, or a playlist URL.`
-  );
+  return { kind: "name", name: value };
 }
 
 /** Accepts a bare track id, a track URL, or a `spotify:track:ID` URI. Returns the URI. */
@@ -235,7 +239,7 @@ export interface PlayEntry {
 /** Shared shape for the track objects returned by playlists, search and history. */
 function toTrack(raw: any, addedAt: string | null = null): PlaylistTrack {
   return {
-    name: raw?.name ?? "(unknown title)",
+    name: raw?.name || "(unknown title)",
     artists: (raw?.artists ?? []).map((a: any) => a.name).filter(Boolean),
     album: raw?.album?.name ?? "",
     uri: raw?.uri ?? "",
@@ -248,6 +252,21 @@ export interface PlaylistMeta {
   name: string;
   owner: string;
   total: number;
+}
+
+export interface PlaylistSummary {
+  id: string;
+  name: string;
+  owner: string;
+  total: number;
+  /** Only playlists you own can be modified; the rest are merely followed. */
+  owned: boolean;
+}
+
+export interface ResolvedPlaylist {
+  id: string;
+  /** Present only when the reference was resolved from a name. */
+  name?: string;
 }
 
 interface RequestOptions {
@@ -401,6 +420,102 @@ export class SpotifyClient {
     return this.request("/me");
   }
 
+  /** Memoised — the authorized account cannot change within a process. */
+  private userIdPromise: Promise<string> | null = null;
+
+  async userId(): Promise<string> {
+    this.userIdPromise ??= this.currentUser().then((me) => me.id);
+    return this.userIdPromise;
+  }
+
+  /** Every playlist in the user's library (owned and followed), following pagination. */
+  async allPlaylists(): Promise<PlaylistSummary[]> {
+    const me = await this.userId();
+    const summaries: PlaylistSummary[] = [];
+    let offset = 0;
+    const limit = 50;
+
+    for (;;) {
+      const page = await this.request<any>("/me/playlists", { query: { limit, offset } });
+      const items: any[] = page.items ?? [];
+
+      for (const p of items) {
+        if (!p?.id) continue;
+        summaries.push({
+          id: p.id,
+          // Spotify permits an empty name, so `||` not `??`.
+          name: p.name || "(untitled)",
+          owner: p.owner?.display_name ?? p.owner?.id ?? "unknown",
+          // Playlists renamed `tracks` to `items`; accept either for the count.
+          total: p.items?.total ?? p.tracks?.total ?? 0,
+          owned: p.owner?.id === me,
+        });
+      }
+
+      offset += items.length;
+      if (!page.next || items.length === 0) break;
+    }
+
+    return summaries;
+  }
+
+  /**
+   * Turns a playlist reference into an id, looking names up in the library.
+   *
+   * Matching narrows through exact, then case-insensitive, then substring; the
+   * first tier with any hit wins. Ambiguity is an error rather than a guess.
+   * `forWrite` additionally refuses substring matches, since silently modifying
+   * the wrong playlist is far worse than making the caller be explicit.
+   */
+  async resolvePlaylist(
+    input: string | undefined | null,
+    opts: { forWrite?: boolean } = {}
+  ): Promise<ResolvedPlaylist> {
+    const ref = parsePlaylistRef(input);
+    if (ref.kind === "id") return { id: ref.id };
+
+    const wanted = ref.name;
+    const lower = wanted.toLowerCase();
+    const all = await this.allPlaylists();
+    const pool = opts.forWrite ? all.filter((p) => p.owned) : all;
+
+    const exact = pool.filter((p) => p.name === wanted);
+    const insensitive = pool.filter((p) => p.name.toLowerCase() === lower);
+    const substring = pool.filter((p) => p.name.toLowerCase().includes(lower));
+
+    const [matches, tier] = exact.length
+      ? ([exact, "exact"] as const)
+      : insensitive.length
+        ? ([insensitive, "case-insensitive"] as const)
+        : ([substring, "substring"] as const);
+
+    if (!matches.length) {
+      throw new SpotifyError(
+        `No ${opts.forWrite ? "playlist you own" : "playlist"} named "${wanted}". ` +
+          `Use list_playlists to see what's available, or pass an id.`
+      );
+    }
+
+    if (matches.length > 1) {
+      const shown = matches.slice(0, 8).map((p) => `  ${p.name} (${p.id})`);
+      throw new SpotifyError(
+        `"${wanted}" matches ${matches.length} playlists — pass an id to disambiguate:\n` +
+          shown.join("\n") +
+          (matches.length > shown.length ? `\n  ...and ${matches.length - shown.length} more` : "")
+      );
+    }
+
+    const match = matches[0];
+    if (opts.forWrite && tier === "substring") {
+      throw new SpotifyError(
+        `Refusing to modify "${match.name}" from the partial name "${wanted}" — a wrong match ` +
+          `would write to the wrong playlist. Pass the full name or the id (${match.id}).`
+      );
+    }
+
+    return { id: match.id, name: match.name };
+  }
+
   async playlistMeta(playlistId: string): Promise<PlaylistMeta> {
     const data = await this.request<any>(`/playlists/${playlistId}`, {
       query: { fields: "id,name,owner(display_name,id),items(total)" },
@@ -504,6 +619,21 @@ export class SpotifyClient {
       await this.request(`/playlists/${playlistId}/items`, {
         method: "POST",
         body: { uris: uris.slice(i, i + 100) },
+      });
+    }
+    return uris.length;
+  }
+
+  /**
+   * Removes URIs in chunks of 100. Note Spotify deletes *every* occurrence of a
+   * URI, so a track sitting in the playlist twice disappears entirely.
+   */
+  async removeTracks(playlistId: string, uris: string[]): Promise<number> {
+    for (let i = 0; i < uris.length; i += 100) {
+      await this.request(`/playlists/${playlistId}/items`, {
+        method: "DELETE",
+        // The body key follows the endpoint rename: `items`, not `tracks`.
+        body: { items: uris.slice(i, i + 100).map((uri) => ({ uri })) },
       });
     }
     return uris.length;

@@ -11,9 +11,11 @@ Runs over stdio on your machine. Credentials and tokens never leave it.
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
+| `list_playlists` | `owned_only?`, `query?` | Every playlist in your library with id, track count and ownership |
 | `pull_playlist` | `playlist_id?` | The **entire** tracklist (all pages) as `artist(s) - title  [spotify:track:URI]  added YYYY-MM-DD` |
 | `search_tracks` | `query`, `limit?` (1–20, default 5) | `artist(s) - title \| album \| spotify:track:URI` per match |
 | `add_tracks` | `uris[]`, `playlist_id?` | Count added (batched in chunks of 100) |
+| `remove_tracks` | `uris[]`, `playlist_id?` | Count removed — **every** occurrence of each URI |
 | `playlist_stats` | `playlist_id?` | Name, owner, track count, top 15 primary artists |
 | `top_tracks` | `time_range?`, `limit?` (1–50, default 20) | Your most-played tracks, in rank order |
 | `top_artists` | `time_range?`, `limit?` (1–50, default 20) | Your most-played artists, in rank order, with genres |
@@ -23,12 +25,34 @@ Runs over stdio on your machine. Credentials and tokens never leave it.
 `time_range` is `short_term` (~4 weeks), `medium_term` (~6 months, the default) or
 `long_term` (several years).
 
-`playlist_id` accepts a bare id, `spotify:playlist:ID`, or an
-`open.spotify.com/playlist/ID?...` URL. When omitted it falls back to the
-`SPOTIFY_DEFAULT_PLAYLIST` env var; with neither set you get a clear validation error.
-No playlist is hardcoded — the server works against any playlist the authorized user can
+No playlist is hardcoded — every tool works against any playlist the authorized user can
 read or modify. Local files, unavailable tracks and podcast episodes are skipped and
 reported as a count.
+
+### Naming a playlist
+
+`playlist_id` accepts four forms:
+
+| Form | Example |
+| --- | --- |
+| Name | `Electronic` |
+| Bare id | `1VdAWOel0ZEN1GBrIbqxox` |
+| URI | `spotify:playlist:1VdAWOel0ZEN1GBrIbqxox` |
+| URL | `https://open.spotify.com/playlist/1VdAWOel0ZEN1GBrIbqxox?si=...` |
+
+Omitted, it falls back to `SPOTIFY_DEFAULT_PLAYLIST`; with neither set you get a clear
+validation error. Ids are recognised by shape — Spotify ids are always 22 base62
+characters — so anything else is treated as a name and looked up in your library.
+
+Name matching narrows through **exact → case-insensitive → substring**, and the first tier
+with a hit wins. Two rules keep it safe:
+
+- **Ambiguity is an error, never a guess.** A name matching several playlists returns the
+  candidates and their ids so you can pick.
+- **Writes are stricter than reads.** `add_tracks` and `remove_tracks` only consider
+  playlists you own, and refuse substring matches outright — `"ADHD"` will read from
+  *ADHD Wall Of Sound* but not write to it. Pass the full name or the id. Write results
+  name the playlist they resolved to, so a write is never silent about its target.
 
 ## Listening history: no play counts
 
@@ -151,7 +175,12 @@ Read from the process environment first, falling back to `.env` in the repo root
 
 - **Pagination:** `pull_playlist` and `playlist_stats` walk the playlist 100 items at a
   time until Spotify stops returning a `next` page, so 100+ track playlists come back
-  whole.
+  whole. `list_playlists` does the same in pages of 50. Note Spotify's `total` for the
+  playlist *library* can overcount by one or more (it counts entries it then declines to
+  return); the tools report what was actually retrieved.
+- **Deletes remove every occurrence:** `remove_tracks` deletes all copies of a URI, which
+  is Spotify's behaviour, not a choice this server makes. Removing one of two duplicates
+  is not possible by URI alone.
 - **Token handling:** the access token is refreshed when expired and, on a `401`, refreshed
   and the request retried once.
 - **Rate limits:** a `429` is retried once after the `Retry-After` delay (waits longer than
@@ -163,7 +192,7 @@ Read from the process environment first, falling back to `.env` in the repo root
 ## Layout
 
 ```
-src/server.ts   McpServer + stdio transport, the 8 tools
+src/server.ts   McpServer + stdio transport, the 10 tools
 src/spotify.ts  Web API client, token cache/refresh, id normalisation, pagination
 src/auth.ts     one-time OAuth CLI (pnpm auth)
 ```

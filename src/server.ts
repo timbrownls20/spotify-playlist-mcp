@@ -14,7 +14,6 @@ import {
   formatPlayedAt,
   loadConfig,
   missingScopes,
-  normalizePlaylistId,
   normalizeTimeRange,
   normalizeTrackUri,
   readTokenCache,
@@ -46,9 +45,15 @@ const playlistIdArg = z
   .string()
   .optional()
   .describe(
-    "Playlist to target: bare id, spotify:playlist:ID, or an open.spotify.com/playlist/... URL. " +
-      "Defaults to the SPOTIFY_DEFAULT_PLAYLIST env var when omitted."
+    "Playlist to target: its name (e.g. 'Electronic'), a bare id, spotify:playlist:ID, or an " +
+      "open.spotify.com/playlist/... URL. Names are matched against your library and must be " +
+      "unambiguous. Defaults to the SPOTIFY_DEFAULT_PLAYLIST env var when omitted."
   );
+
+/** Shows which playlist a name actually resolved to, so a write is never silent. */
+function describeTarget(target: { id: string; name?: string }): string {
+  return target.name ? `${target.name} (${target.id})` : target.id;
+}
 
 const timeRangeArg = z
   .enum(TIME_RANGES)
@@ -73,7 +78,7 @@ server.registerTool(
   },
   async ({ playlist_id }) => {
     try {
-      const id = normalizePlaylistId(playlist_id);
+      const { id } = await spotify.resolvePlaylist(playlist_id);
       const meta = await spotify.playlistMeta(id);
       const { tracks, skipped } = await spotify.allTracks(id);
 
@@ -139,15 +144,96 @@ server.registerTool(
   },
   async ({ uris, playlist_id }) => {
     try {
-      const id = normalizePlaylistId(playlist_id);
       const cleaned = uris.map((u) => (u ?? "").trim()).filter(Boolean).map(normalizeTrackUri);
       if (!cleaned.length) return text("No track URIs supplied — nothing added.");
 
-      const added = await spotify.addTracks(id, cleaned);
+      const target = await spotify.resolvePlaylist(playlist_id, { forWrite: true });
+      const added = await spotify.addTracks(target.id, cleaned);
       const batches = Math.ceil(added / 100);
       return text(
-        `Added ${added} track(s) to playlist ${id}` +
+        `Added ${added} track(s) to ${describeTarget(target)}` +
           (batches > 1 ? ` in ${batches} batches of up to 100.` : ".")
+      );
+    } catch (err) {
+      return failure(err);
+    }
+  }
+);
+
+server.registerTool(
+  "list_playlists",
+  {
+    title: "List playlists",
+    description:
+      "Every playlist in the user's library, with id, track count and whether they own it " +
+      "(only owned playlists can be modified). Use this to find a playlist id or name.",
+    inputSchema: {
+      owned_only: z
+        .boolean()
+        .optional()
+        .describe("Only playlists the user owns and can modify (default false)."),
+      query: z.string().optional().describe("Case-insensitive substring filter on the name."),
+    },
+  },
+  async ({ owned_only, query }) => {
+    try {
+      const all = await spotify.allPlaylists();
+      const needle = (query ?? "").trim().toLowerCase();
+      const shown = all
+        .filter((p) => (owned_only ? p.owned : true))
+        .filter((p) => (needle ? p.name.toLowerCase().includes(needle) : true));
+
+      if (!shown.length) {
+        return text(
+          `No playlists match` +
+            (needle ? ` "${query}"` : "") +
+            (owned_only ? " among those you own." : ".") +
+            ` Library holds ${all.length}.`
+        );
+      }
+
+      const lines = shown.map(
+        (p) =>
+          `${p.owned ? "*" : " "} ${p.name}  [${p.id}]  ${p.total} tracks  owner: ${p.owner}`
+      );
+      const owned = all.filter((p) => p.owned).length;
+      const header =
+        `${shown.length} of ${all.length} playlist(s)` +
+        (needle || owned_only ? " matching your filter" : "") +
+        `. ${owned} owned (marked *) and modifiable; the rest are followed and read-only.`;
+
+      return text([header, "", ...lines].join("\n"));
+    } catch (err) {
+      return failure(err);
+    }
+  }
+);
+
+server.registerTool(
+  "remove_tracks",
+  {
+    title: "Remove tracks",
+    description:
+      "Remove tracks from a playlist. Accepts spotify:track: URIs (track URLs and bare ids too). " +
+      "Removes EVERY occurrence of each URI, so a duplicated track disappears entirely. " +
+      "Batched in chunks of 100.",
+    inputSchema: {
+      uris: z.array(z.string()).describe("Track URIs to remove."),
+      playlist_id: playlistIdArg,
+    },
+  },
+  async ({ uris, playlist_id }) => {
+    try {
+      const cleaned = uris.map((u) => (u ?? "").trim()).filter(Boolean).map(normalizeTrackUri);
+      if (!cleaned.length) return text("No track URIs supplied — nothing removed.");
+
+      const target = await spotify.resolvePlaylist(playlist_id, { forWrite: true });
+      const removed = await spotify.removeTracks(target.id, cleaned);
+      const batches = Math.ceil(removed / 100);
+      return text(
+        `Removed ${removed} track URI(s) from ${describeTarget(target)}` +
+          (batches > 1 ? ` in ${batches} batches of up to 100.` : ".") +
+          " All occurrences of each URI were removed."
       );
     } catch (err) {
       return failure(err);
@@ -164,7 +250,7 @@ server.registerTool(
   },
   async ({ playlist_id }) => {
     try {
-      const id = normalizePlaylistId(playlist_id);
+      const { id } = await spotify.resolvePlaylist(playlist_id);
       const meta = await spotify.playlistMeta(id);
       const { tracks, skipped } = await spotify.allTracks(id);
 
@@ -304,7 +390,7 @@ server.registerTool(
   },
   async ({ playlist_id, time_range }) => {
     try {
-      const id = normalizePlaylistId(playlist_id);
+      const { id } = await spotify.resolvePlaylist(playlist_id);
       const range = normalizeTimeRange(time_range);
 
       const meta = await spotify.playlistMeta(id);
@@ -383,7 +469,7 @@ async function checkScopes() {
 async function main() {
   await checkScopes();
   await server.connect(new StdioServerTransport());
-  console.error("[spotify-playlist-mcp] ready on stdio (8 tools)");
+  console.error("[spotify-playlist-mcp] ready on stdio (10 tools)");
 }
 
 main().catch((err) => {
