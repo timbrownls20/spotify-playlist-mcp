@@ -328,13 +328,13 @@ export class SpotifyClient {
 
   async playlistMeta(playlistId: string): Promise<PlaylistMeta> {
     const data = await this.request<any>(`/playlists/${playlistId}`, {
-      query: { fields: "id,name,owner(display_name,id),tracks(total)" },
+      query: { fields: "id,name,owner(display_name,id),items(total)" },
     });
     return {
       id: data.id,
       name: data.name,
       owner: data.owner?.display_name ?? data.owner?.id ?? "unknown",
-      total: data.tracks?.total ?? 0,
+      total: data.items?.total ?? 0,
     };
   }
 
@@ -349,18 +349,18 @@ export class SpotifyClient {
     const limit = 100;
 
     for (;;) {
-      const page = await this.request<any>(`/playlists/${playlistId}/tracks`, {
+      const page = await this.request<any>(`/playlists/${playlistId}/items`, {
         query: {
           limit,
           offset,
           fields:
-            "items(added_at,is_local,track(name,uri,type,is_local,album(name),artists(name))),next,total",
+            "items(added_at,is_local,item(name,uri,type,is_local,album(name),artists(name))),next,total",
         },
       });
 
       const items: any[] = page.items ?? [];
       for (const item of items) {
-        const track = item?.track;
+        const track = item?.item;
         if (!track || item.is_local || track.is_local || track.type !== "track" || !track.uri) {
           skipped++;
           continue;
@@ -397,7 +397,7 @@ export class SpotifyClient {
   /** Adds URIs in chunks of 100 (the API limit). Returns the number added. */
   async addTracks(playlistId: string, uris: string[]): Promise<number> {
     for (let i = 0; i < uris.length; i += 100) {
-      await this.request(`/playlists/${playlistId}/tracks`, {
+      await this.request(`/playlists/${playlistId}/items`, {
         method: "POST",
         body: { uris: uris.slice(i, i + 100) },
       });
